@@ -3,6 +3,9 @@
 This kit targets the interview described: practical Python/PyTorch debugging,
 not model tuning or exploratory analysis.
 
+Keep [`CHEATSHEET.md`](CHEATSHEET.md) open for the symptom-to-fix decision
+guide, tensor inspection commands, and common PyTorch failure patterns.
+
 ## Recommended setup
 
 ```bash
