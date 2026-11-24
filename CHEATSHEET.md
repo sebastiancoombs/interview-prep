@@ -119,6 +119,298 @@ Useful `pdb` commands:
 - `a`: show function arguments
 - `q`: quit
 
+## Understanding tensor shapes
+
+### Shape vocabulary
+
+A tensor's **rank** is its number of dimensions (axes). Its **shape** gives the
+size of each dimension.
+
+```python
+x = torch.zeros(32, 10, 128)
+print(x.ndim)       # 3 dimensions
+print(x.shape)      # torch.Size([32, 10, 128])
+print(x.shape[0])   # 32 items along dimension 0
+print(x.shape[-1])  # 128 items along the final dimension
+```
+
+Common letters:
+
+| Letter | Meaning | Example |
+|---|---|---|
+| `B` or `N` | batch size: number of examples processed together | `32` sentences |
+| `F` | number of input features | `12` columns per customer |
+| `C` | channels or classes, depending on context | `3` RGB channels or `10` classes |
+| `H`, `W` | image height and width | `224 × 224` pixels |
+| `L` or `T` | sequence length or time steps | `50` tokens |
+| `D` | embedding, hidden, or feature width | `128` values per token |
+| `V` | vocabulary size | `30,000` possible token IDs |
+
+The letters describe the **meaning** of each axis. The numbers are the current
+sizes. For example, `(B, L, D) = (32, 50, 128)` means 32 examples, 50 tokens
+per example, and 128 learned features per token.
+
+### Common input and output shapes
+
+| Data or tensor | Typical shape | What each dimension means |
+|---|---|---|
+| One tabular example | `(F,)` | `F` feature values |
+| Tabular batch | `(B, F)` | examples × features |
+| One RGB image | `(C, H, W)` | channels × height × width |
+| Image batch | `(B, C, H, W)` | examples × channels × height × width |
+| Token IDs | `(B, L)` | examples × token positions |
+| Token embeddings | `(B, L, D)` | examples × token positions × features |
+| Sequence mask | `(B, L)` | whether each token position is valid |
+| Multiclass logits | `(B, C)` | one score per class for each example |
+| Multiclass labels | `(B,)` | one integer class ID per example |
+| Binary logits | `(B,)` or `(B, 1)` | one score per example |
+| Segmentation logits | `(B, C, H, W)` | class scores at every pixel |
+| Segmentation labels | `(B, H, W)` | one class ID at every pixel |
+
+`C` is overloaded: near image input it usually means image channels; at the
+classifier output it usually means classes. Use variable names and surrounding
+operations to determine which meaning applies.
+
+### The batch dimension
+
+Dimension 0 is usually the batch dimension. A model may expect a batch even
+when you have only one example.
+
+```python
+image.shape                  # (3, 224, 224): one image
+image = image.unsqueeze(0)
+image.shape                  # (1, 3, 224, 224): batch of one
+```
+
+If a `DataLoader` uses `batch_size=32`, it normally adds the leading `B=32`
+dimension. The final batch can be smaller unless `drop_last=True`.
+
+Never hard-code the batch size into a reshape:
+
+```python
+x = x.reshape(x.shape[0], -1)  # preserves the actual batch size
+```
+
+### What common layers do to shapes
+
+#### `nn.Linear`
+
+`nn.Linear(D_in, D_out)` transforms the **last** dimension:
+
+```text
+(B, D_in)    -> (B, D_out)
+(B, L, D_in) -> (B, L, D_out)
+```
+
+It keeps every leading dimension. The required contract is:
+
+```python
+x.shape[-1] == linear.in_features
+```
+
+The weight is stored as `(D_out, D_in)`, which can look reversed when printed.
+
+#### `nn.Embedding`
+
+An embedding turns each integer ID into a vector:
+
+```text
+token IDs:  (B, L)    integer IDs
+embedding:  (V, D)    lookup table
+output:     (B, L, D) one D-wide vector per token
+```
+
+The embedding adds a feature dimension; it does not remove the sequence
+dimension.
+
+#### `nn.Conv2d`
+
+PyTorch convolution expects channel-first image batches:
+
+```text
+input:  (B, C_in,  H_in,  W_in)
+output: (B, C_out, H_out, W_out)
+```
+
+`C_in` must match the layer's `in_channels`. `C_out` is set by `out_channels`.
+Stride, padding, dilation, and kernel size determine the new height and width.
+
+If image data arrives as `(B, H, W, C)`, reorder axes—do not reshape:
+
+```python
+x = x.permute(0, 3, 1, 2)  # BHWC -> BCHW
+```
+
+#### Pooling and flattening
+
+Global/adaptive pooling can reduce spatial dimensions:
+
+```text
+(B, C, H, W) -> AdaptiveAvgPool2d((1, 1)) -> (B, C, 1, 1)
+```
+
+Then flatten features while preserving the batch:
+
+```python
+x = torch.flatten(x, start_dim=1)  # (B, C, 1, 1) -> (B, C)
+```
+
+#### RNNs and transformers
+
+Many sequence layers use one of two layouts:
+
+```text
+batch_first=True:  (B, L, D)
+batch_first=False: (L, B, D)
+```
+
+Check the layer configuration before swapping dimensions. A tensor can have
+the right rank but silently use the wrong axis order.
+
+### End-to-end shape examples
+
+Text classification:
+
+```text
+token IDs                 (32, 50)      B=32, L=50
+nn.Embedding(30000, 128)  (32, 50, 128) adds D=128
+mean over dim=1           (32, 128)     removes token axis L
+nn.Linear(128, 4)         (32, 4)       four class logits
+targets                   (32,)         one class ID per example
+```
+
+```python
+embedded = embedding(token_ids)  # (B, L, D)
+pooled = embedded.mean(dim=1)    # average tokens -> (B, D)
+logits = classifier(pooled)      # (B, C)
+loss = criterion(logits, targets)
+```
+
+Image classification:
+
+```text
+RGB images                (32, 3, 224, 224)
+convolution block         (32, 64, 56, 56)
+adaptive average pool     (32, 64, 1, 1)
+flatten from dim 1        (32, 64)
+nn.Linear(64, 10)         (32, 10) ten class logits
+targets                   (32,)    one class ID per image
+```
+
+Tabular classification:
+
+```text
+input features            (32, 12) 12 columns per row
+nn.Linear(12, 64)         (32, 64)
+nn.Linear(64, 3)          (32, 3)  three class logits
+targets                   (32,)
+```
+
+### Shape-changing operations
+
+| Operation | Meaning | Example |
+|---|---|---|
+| `unsqueeze(dim)` | add a size-1 axis | `(C,H,W)` → `(1,C,H,W)` |
+| `squeeze(dim)` | remove one known size-1 axis | `(B,1)` → `(B,)` |
+| `flatten(start_dim=1)` | combine dimensions | `(B,C,H,W)` → `(B,C×H×W)` |
+| `reshape(...)` | regroup the same elements | `(B,L,D)` → `(B,L×D)` |
+| `permute(...)` | reorder axes | `(B,H,W,C)` → `(B,C,H,W)` |
+| `transpose(a,b)` | swap two axes | `(B,L,D)` → `(B,D,L)` |
+| `mean(dim=k)` | reduce/remove axis `k` | `(B,L,D)` → `(B,D)` for `k=1` |
+| `stack(..., dim=k)` | add a new axis | two `(B,D)` tensors → `(2,B,D)` |
+| `cat(..., dim=k)` | extend an existing axis | two `(B,D)` tensors → `(B,2D)` |
+
+`reshape` changes grouping, while `permute` changes axis order. They are not
+interchangeable. The number of elements must stay constant across a reshape:
+
+```python
+assert x.numel() == reshaped.numel()
+```
+
+Use a specific dimension with `squeeze(dim)` so a batch of size 1 does not
+accidentally lose its batch axis.
+
+### A repeatable shape-debugging method
+
+1. Write the intended shape above each important line.
+2. Break immediately before the failing operation.
+3. Print the actual input shapes and the layer's expected attributes.
+4. Find the **first** line where actual and intended shapes diverge.
+5. Fix the semantic operation at that line—not just the final reshape.
+6. Test with batch size 1 and a normal batch to catch unsafe `squeeze()` code.
+
+```python
+print("raw batch:", inputs.shape)
+x = embedding(inputs)
+print("after embedding:", x.shape)
+x = x.mean(dim=1)
+print("after pooling:", x.shape)
+print("classifier expects:", classifier.in_features)
+logits = classifier(x)
+print("logits:", logits.shape, "targets:", targets.shape)
+```
+
+For a larger model, temporary forward hooks show the input and output shapes of
+each leaf module:
+
+```python
+def show_shape(name):
+    def hook(module, inputs, output):
+        input_shapes = [getattr(value, "shape", None) for value in inputs]
+        output_shape = getattr(output, "shape", None)
+        print(name, input_shapes, "->", output_shape)
+    return hook
+
+handles = []
+for name, module in model.named_modules():
+    if not list(module.children()):
+        handles.append(module.register_forward_hook(show_shape(name)))
+
+model(sample_batch)
+
+for handle in handles:
+    handle.remove()
+```
+
+Remove hooks after debugging so they do not keep printing during training.
+
+### Decode common shape errors
+
+```text
+mat1 and mat2 shapes cannot be multiplied (B×K and I×O)
+```
+
+The input's final size `K` does not match the linear layer's `in_features=I`.
+Inspect the operation that produced `K`.
+
+```text
+Expected 4-dimensional input for 4-dimensional weight
+```
+
+`Conv2d` expected `(B,C,H,W)`. You may be missing the batch or channel axis,
+or the data may be in `(B,H,W,C)` order.
+
+```text
+Dimension out of range
+```
+
+Code referenced an axis that does not exist. Print `x.ndim` and remember that
+valid positive indices are `0` through `x.ndim - 1`.
+
+```text
+Sizes of tensors must match except in dimension ...
+```
+
+For `torch.cat`, every dimension except the concatenation dimension must match.
+Print all input shapes and decide which semantic axis should grow.
+
+```text
+permute: number of dimensions ... does not match
+```
+
+`permute` needs exactly one index for each existing axis. Print `x.shape` before
+choosing the new order.
+
 ## Common mistakes and fixes
 
 ### 1. Matrix or linear-layer shape mismatch
@@ -147,6 +439,7 @@ self.fc = nn.Linear(actual_width, num_classes)
 ```
 
 Avoid `x.view(-1, something)` unless you can explain every dimension.
+See **Understanding tensor shapes** above for complete layer-by-layer examples.
 
 ### 2. Batch or target shape mismatch
 
